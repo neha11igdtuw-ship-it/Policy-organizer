@@ -1,0 +1,149 @@
+// Prisma schema for Policy Organizer MVP.
+// NOTE: Soft delete is intentionally NOT used for Policy — compliance requires
+// a real hard-delete cascade (see routes/policies.ts DELETE handler + README).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  cognitoSub    String         @unique
+  fullName      String
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  policies      Policy[]
+  sharedAccess  SharedAccess[] @relation("SharedWithUser")
+  auditLogs     AuditLog[]
+}
+
+enum PolicyType {
+  LIFE
+  ANNUITY
+  HEALTH
+}
+
+model Policy {
+  id             String         @id @default(uuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id])
+
+  policyType     PolicyType
+  sourceFileKey  String // S3 object key for the original uploaded PDF/photo
+  sourceFileName String
+
+  // Convenience denormalized columns for dashboard queries; the
+  // authoritative, per-field confidence-scored values live in PolicyField.
+  carrier        String?
+  policyNumber   String?
+  coverageAmount Decimal?       @db.Decimal(14, 2)
+  premiumAmount  Decimal?       @db.Decimal(14, 2)
+  renewalDate    DateTime?
+  surrenderDate  DateTime?
+
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  fields         PolicyField[]
+  beneficiaries  Beneficiary[]
+  reminders      Reminder[]
+  sharedAccess   SharedAccess[]
+
+  @@index([userId])
+}
+
+// One row per extracted field, so each field carries its own confidence score
+// and review status independently of the others.
+model PolicyField {
+  id               String   @id @default(uuid())
+  policyId         String
+  policy           Policy   @relation(fields: [policyId], references: [id])
+
+  fieldName        String // e.g. "carrier", "policy_number", "coverage_amount"
+  value            String // stored as text; callers parse/format per fieldName
+  confidenceScore  Float // 0.0 - 1.0, produced by the extraction worker
+  userConfirmed    Boolean  @default(false)
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([policyId])
+  @@unique([policyId, fieldName])
+}
+
+model Beneficiary {
+  id           String   @id @default(uuid())
+  policyId     String
+  policy       Policy   @relation(fields: [policyId], references: [id])
+
+  name         String
+  relationship String?
+  percentage   Decimal? @db.Decimal(5, 2)
+  confirmed    Boolean  @default(false)
+
+  createdAt    DateTime @default(now())
+
+  @@index([policyId])
+}
+
+enum ReminderType {
+  RENEWAL
+  PREMIUM_DUE
+  SURRENDER_WINDOW
+}
+
+model Reminder {
+  id         String       @id @default(uuid())
+  policyId   String
+  policy     Policy       @relation(fields: [policyId], references: [id])
+
+  type       ReminderType
+  dueDate    DateTime
+  sentAt     DateTime?
+
+  createdAt  DateTime     @default(now())
+
+  @@index([policyId])
+  @@index([dueDate])
+}
+
+// Read-only by design: there is no "role"/"scope" field offering write access.
+// The invited family member can only ever view policy data.
+model SharedAccess {
+  id             String   @id @default(uuid())
+  policyId       String
+  policy         Policy   @relation(fields: [policyId], references: [id])
+
+  sharedWithUserId String?
+  sharedWithUser   User?    @relation("SharedWithUser", fields: [sharedWithUserId], references: [id])
+  invitedEmail     String // invite sent before the recipient has an account
+
+  invitedAt        DateTime @default(now())
+  acceptedAt       DateTime?
+  revokedAt        DateTime?
+
+  @@index([policyId])
+}
+
+// Append-only. Used for compliance trails, including recording hard deletes
+// (where the resource itself no longer exists to look up).
+model AuditLog {
+  id           String   @id @default(uuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+
+  action       String // e.g. "POLICY_HARD_DELETE", "POLICY_VIEWED", "SHARE_GRANTED"
+  resourceType String // e.g. "Policy", "SharedAccess"
+  resourceId   String
+  timestamp    DateTime @default(now())
+
+  @@index([userId])
+  @@index([resourceType, resourceId])
+}
